@@ -28,6 +28,7 @@
 #define NY MV_COUNT
 #define LR 0.01f
 #define GAMMA 0.99f
+#define ENTROPY_BETA 0.01f
 #define WIN_WINDOW        200
 #define ADVANCE_THRESHOLD 0.95f
 #define MAX_SCRAMBLE      30
@@ -35,7 +36,10 @@
 
 typedef struct {
     float x[NX];
+    float h[NH];
+    float probs[NY];
     int   action;
+    int   forbidden_face;
 } Step;
 
 typedef struct {
@@ -90,25 +94,29 @@ static void run_one_episode(void) {
 
     int T = 0;
     int solved = 0;
+    int prev_face = -1;
     for (int s = 0; s < budget; s++) {
         encode(&app.cube, app.traj[T].x);
-        mlp_forward(app.net, app.traj[T].x);
+        mlp_forward(app.net, app.traj[T].x, prev_face);
+        memcpy(app.traj[T].h,     app.net->h,     sizeof(float) * NH);
+        memcpy(app.traj[T].probs, app.net->probs, sizeof(float) * NY);
         int a = mlp_sample_action(app.net, &app.rng);
         app.traj[T].action = a;
+        app.traj[T].forbidden_face = prev_face;
+        prev_face = a / 3;
         T++;
         cube_apply_move(&app.cube, (Move)a);
         if (cube_is_solved(&app.cube)) { solved = 1; break; }
     }
 
-    if (solved) {
-        mlp_zero_grad(app.net);
-        for (int t = 0; t < T; t++) {
-            float G = powf(GAMMA, (float)(T - 1 - t));
-            mlp_forward(app.net, app.traj[t].x);
-            mlp_accum_policy_grad(app.net, app.traj[t].x, app.traj[t].action, G);
-        }
-        mlp_apply_sgd(app.net, LR);
+    mlp_zero_grad(app.net);
+    for (int t = 0; t < T; t++) {
+        float G = solved ? powf(GAMMA, (float)(T - 1 - t)) : 0.0f;
+        mlp_accum_policy_grad(app.net, app.traj[t].x, app.traj[t].h,
+                              app.traj[t].probs, app.traj[t].action,
+                              G, ENTROPY_BETA);
     }
+    mlp_apply_sgd(app.net, LR);
 
     int outcome = solved ? 1 : 0;
     if (app.wcount < WIN_WINDOW) {

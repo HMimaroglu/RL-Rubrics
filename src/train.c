@@ -23,6 +23,7 @@
 
 #define LR 0.01f
 #define GAMMA 0.99f
+#define ENTROPY_BETA 0.05f
 #define WIN_WINDOW        200
 #define ADVANCE_THRESHOLD 0.95f
 #define MAX_SCRAMBLE      30
@@ -35,7 +36,10 @@ static void encode(const Cube *c, float *out) {
 
 typedef struct {
     float x[NX];
+    float h[NH];
+    float probs[NY];
     int   action;
+    int   forbidden_face;
 } Step;
 
 /* Scramble by applying `depth` random moves, but avoid consecutive moves on
@@ -95,26 +99,28 @@ int main(int argc, char **argv) {
 
         int T = 0;
         int solved = 0;
+        int prev_face = -1;
         for (int step = 0; step < budget; step++) {
             encode(&cube, traj[T].x);
-            mlp_forward(net, traj[T].x);
+            mlp_forward(net, traj[T].x, prev_face);
+            memcpy(traj[T].h,     net->h,     sizeof(float) * NH);
+            memcpy(traj[T].probs, net->probs, sizeof(float) * NY);
             int action = mlp_sample_action(net, &rng);
             traj[T].action = action;
+            traj[T].forbidden_face = prev_face;
+            prev_face = action / 3;
             T++;
             cube_apply_move(&cube, (Move)action);
             if (cube_is_solved(&cube)) { solved = 1; break; }
         }
 
-        /* REINFORCE update: only when we got signal (reward 1). */
-        if (solved) {
-            mlp_zero_grad(net);
-            for (int t = 0; t < T; t++) {
-                float G = powf(GAMMA, (float)(T - 1 - t));
-                mlp_forward(net, traj[t].x);
-                mlp_accum_policy_grad(net, traj[t].x, traj[t].action, G);
-            }
-            mlp_apply_sgd(net, LR);
+        mlp_zero_grad(net);
+        for (int t = 0; t < T; t++) {
+            float G = solved ? powf(GAMMA, (float)(T - 1 - t)) : 0.0f;
+            mlp_accum_policy_grad(net, traj[t].x, traj[t].h, traj[t].probs,
+                                  traj[t].action, G, ENTROPY_BETA);
         }
+        mlp_apply_sgd(net, LR);
 
         /* Update rolling window */
         int outcome = solved ? 1 : 0;
@@ -130,10 +136,10 @@ int main(int argc, char **argv) {
         stage_eps++;
         if (solved) { stage_solved++; stage_steps_sum += (double)T; }
 
-        if (total_eps % 200 == 0) {
+        if (total_eps % 500 == 0) {
             float wr = (wcount > 0) ? (float)wsum / (float)wcount : 0.0f;
             double avg_len = (stage_solved > 0) ? stage_steps_sum / (double)stage_solved : 0.0;
-            printf("ep=%ld  depth=%d  stage_ep=%ld  win_rate=%.3f  avg_solve_steps=%.2f\n",
+            printf("ep=%ld  depth=%d  stage_ep=%ld  win_rate=%.3f  avg_steps=%.2f\n",
                    total_eps, depth, stage_eps, wr, avg_len);
             fflush(stdout);
         }

@@ -24,7 +24,7 @@ MLP *mlp_new(int nx, int nh, int ny, Rng *rng) {
     /* He init for ReLU hidden layer */
     float s1 = sqrtf(2.0f / (float)nx);
     for (int i = 0; i < nh * nx; i++) m->W1[i] = rng_normal(rng) * s1;
-    /* Smaller init for output layer so initial policy is near-uniform */
+    /* Smaller init for policy head so initial policy is near-uniform */
     float s2 = sqrtf(1.0f / (float)nh) * 0.1f;
     for (int i = 0; i < ny * nh; i++) m->W2[i] = rng_normal(rng) * s2;
 
@@ -40,7 +40,7 @@ void mlp_free(MLP *m) {
     free(m);
 }
 
-void mlp_forward(MLP *m, const float *x) {
+void mlp_forward(MLP *m, const float *x, int forbidden_face) {
     /* Hidden layer: h = ReLU(W1 x + b1) */
     for (int j = 0; j < m->nh; j++) {
         const float *w = m->W1 + (size_t)j * m->nx;
@@ -54,6 +54,14 @@ void mlp_forward(MLP *m, const float *x) {
         float s = m->b2[j];
         for (int i = 0; i < m->nh; i++) s += w[i] * m->h[i];
         m->logits[j] = s;
+    }
+    /* Action mask: block all 3 variants on forbidden_face by setting their
+     * logits far below anything reachable. After softmax the resulting probs
+     * are effectively zero and those actions can't be sampled. */
+    if (forbidden_face >= 0 && forbidden_face < 6) {
+        m->logits[forbidden_face * 3 + 0] = -1e20f;
+        m->logits[forbidden_face * 3 + 1] = -1e20f;
+        m->logits[forbidden_face * 3 + 2] = -1e20f;
     }
     /* Softmax (subtract max for numerical stability) */
     float mx = m->logits[0];
@@ -84,13 +92,39 @@ void mlp_zero_grad(MLP *m) {
     memset(m->db2, 0, sizeof(float) * (size_t)m->ny);
 }
 
-/* REINFORCE step:
- *   loss_t = -advantage * log pi(a_t | x_t)
- *   d loss_t / d logits_j = advantage * (probs_j - 1[j == a_t])
+/* Gradient for one step, combining REINFORCE and an optional entropy
+ * regularizer. Caller provides cached h (from the forward pass that
+ * produced this action) and cached probs (post-mask, post-softmax).
+ *
+ *   REINFORCE:   d/dz_j = advantage * (probs_j - 1[j == action])
+ *   Entropy:     d/dz_j = beta * probs_j * (log probs_j + H)
+ *
+ * where H = -sum_k probs_k log probs_k (masked actions contribute ~0).
+ * Maximizing entropy keeps the softmax from collapsing to one action,
+ * which is the usual cause of plateaus under sparse reward.
  */
-void mlp_accum_policy_grad(MLP *m, const float *x, int action, float advantage) {
+void mlp_accum_policy_grad(MLP *m,
+                            const float *x,
+                            const float *h,
+                            const float *probs,
+                            int action,
+                            float advantage,
+                            float entropy_beta) {
     for (int j = 0; j < m->ny; j++) {
-        m->dlogits[j] = advantage * (m->probs[j] - (j == action ? 1.0f : 0.0f));
+        m->dlogits[j] = advantage * (probs[j] - (j == action ? 1.0f : 0.0f));
+    }
+    if (entropy_beta > 0.0f) {
+        float H = 0.0f;
+        for (int j = 0; j < m->ny; j++) {
+            float p = probs[j];
+            if (p > 1e-12f) H -= p * logf(p);
+        }
+        for (int j = 0; j < m->ny; j++) {
+            float p = probs[j];
+            if (p > 1e-12f) {
+                m->dlogits[j] += entropy_beta * p * (logf(p) + H);
+            }
+        }
     }
     /* Output layer grads */
     for (int j = 0; j < m->ny; j++) m->db2[j] += m->dlogits[j];
@@ -98,13 +132,13 @@ void mlp_accum_policy_grad(MLP *m, const float *x, int action, float advantage) 
         float dz = m->dlogits[j];
         if (dz == 0.0f) continue;
         float *w = m->dW2 + (size_t)j * m->nh;
-        for (int i = 0; i < m->nh; i++) w[i] += dz * m->h[i];
+        for (int i = 0; i < m->nh; i++) w[i] += dz * h[i];
     }
     /* Propagate through output: dh = W2^T dlogits, then ReLU mask */
     for (int i = 0; i < m->nh; i++) {
         float s = 0.0f;
         for (int j = 0; j < m->ny; j++) s += m->W2[(size_t)j * m->nh + i] * m->dlogits[j];
-        m->dh[i] = (m->h[i] > 0.0f) ? s : 0.0f;
+        m->dh[i] = (h[i] > 0.0f) ? s : 0.0f;
     }
     /* Hidden layer grads */
     for (int i = 0; i < m->nh; i++) m->db1[i] += m->dh[i];
