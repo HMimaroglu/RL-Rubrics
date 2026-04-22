@@ -1,0 +1,59 @@
+cmake_minimum_required(VERSION 3.15)
+project(rl_rubrics C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+find_package(glfw3 REQUIRED)
+find_package(OpenGL REQUIRED)
+
+add_executable(rubrics
+    src/main.c
+    src/gl_loader.c
+    src/cube.c
+    src/camera.c
+    src/renderer.c
+)
+
+target_include_directories(rubrics PRIVATE src)
+target_link_libraries(rubrics PRIVATE glfw OpenGL::GL)
+
+# Headless trainer. Shares cube.c with the frontend; no graphics deps.
+add_executable(train
+    src/train.c
+    src/cube.c
+    src/nn.c
+    src/rng.c
+)
+target_include_directories(train PRIVATE src)
+
+if(WIN32)
+    target_link_libraries(rubrics PRIVATE gdi32)
+endif()
+
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(rubrics PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
+# On Windows, copy glfw3.dll next to the exe if it is a shared library
+# so the binary runs without needing msys64/mingw64/bin on PATH.
+if(WIN32)
+    get_target_property(_glfw_type glfw TYPE)
+    if(_glfw_type STREQUAL "SHARED_LIBRARY")
+        add_custom_command(TARGET rubrics POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:glfw>" "$<TARGET_FILE_DIR:rubrics>"
+            VERBATIM)
+    else()
+        # Imported target from MSYS2 may not expose SHARED_LIBRARY;
+        # fall back to probing the standard mingw64 path.
+        set(_glfw_dll "C:/msys64/mingw64/bin/glfw3.dll")
+        if(EXISTS "${_glfw_dll}")
+            add_custom_command(TARGET rubrics POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_glfw_dll}" "$<TARGET_FILE_DIR:rubrics>"
+                VERBATIM)
+        endif()
+    endif()
+endif()
