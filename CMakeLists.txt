@@ -28,6 +28,26 @@ add_executable(train
 )
 target_include_directories(train PRIVATE src)
 
+# Live visualization of training progress: cube + HUD bars.
+add_executable(train_viz
+    src/train_viz.c
+    src/cube.c
+    src/camera.c
+    src/renderer.c
+    src/gl_loader.c
+    src/hud.c
+    src/nn.c
+    src/rng.c
+)
+target_include_directories(train_viz PRIVATE src)
+target_link_libraries(train_viz PRIVATE glfw OpenGL::GL)
+if(WIN32)
+    target_link_libraries(train_viz PRIVATE gdi32)
+endif()
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(train_viz PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
 if(WIN32)
     target_link_libraries(rubrics PRIVATE gdi32)
 endif()
