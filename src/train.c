@@ -24,6 +24,10 @@
 #define LR 0.01f
 #define GAMMA 0.99f
 #define ENTROPY_BETA 0.05f
+#define VALUE_COEF   0.25f   /* MSE coefficient for the value head; small
+                                enough that value-head gradients into the
+                                shared trunk don't dominate the policy
+                                gradients (which scale with advantage). */
 #define WIN_WINDOW        200
 #define ADVANCE_THRESHOLD 0.95f
 #define MAX_SCRAMBLE      30
@@ -38,6 +42,7 @@ typedef struct {
     float x[NX];
     float h[NH];
     float probs[NY];
+    float value;            /* V(s_t) cached at sample time */
     int   action;
     int   forbidden_face;
 } Step;
@@ -105,6 +110,7 @@ int main(int argc, char **argv) {
             mlp_forward(net, traj[T].x, prev_face);
             memcpy(traj[T].h,     net->h,     sizeof(float) * NH);
             memcpy(traj[T].probs, net->probs, sizeof(float) * NY);
+            traj[T].value = net->value;
             int action = mlp_sample_action(net, &rng);
             traj[T].action = action;
             traj[T].forbidden_face = prev_face;
@@ -114,11 +120,15 @@ int main(int argc, char **argv) {
             if (cube_is_solved(&cube)) { solved = 1; break; }
         }
 
+        /* Actor-critic update. Advantage = G - V(s) is computed inside
+         * mlp_accum_ac_grad. The value head learns to predict the return
+         * from each state, providing a per-state baseline for the policy. */
         mlp_zero_grad(net);
         for (int t = 0; t < T; t++) {
             float G = solved ? powf(GAMMA, (float)(T - 1 - t)) : 0.0f;
-            mlp_accum_policy_grad(net, traj[t].x, traj[t].h, traj[t].probs,
-                                  traj[t].action, G, ENTROPY_BETA);
+            mlp_accum_ac_grad(net, traj[t].x, traj[t].h, traj[t].probs,
+                              traj[t].value, traj[t].action, G,
+                              ENTROPY_BETA, VALUE_COEF);
         }
         mlp_apply_sgd(net, LR);
 

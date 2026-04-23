@@ -3,25 +3,39 @@
 
 #include "rng.h"
 
-/* Two-layer MLP policy network:
- *   x -> W1 -> ReLU -> W2 -> softmax -> action distribution
- * Forward caches h, logits, probs inside the struct so the backward pass
- * can reuse them. */
+/* Actor-critic MLP with a shared trunk:
+ *   x -> W1 -> ReLU (nh) -> { policy head (W2, b2, softmax over ny)
+ *                           , value  head (Wv, bv, scalar V(s))      }
+ *
+ * The policy head uses advantage = G - V(s) as its coefficient, which
+ * gives it a per-state baseline and cuts gradient variance hugely vs. a
+ * single global baseline. The value head is trained by MSE(V, G) and its
+ * gradients flow back through the shared trunk to improve the hidden
+ * representation for both heads.
+ *
+ * Value head weights are initialized to zero so V=0 at start. This means
+ * advantage = G - 0 = G initially, and early training behaves exactly
+ * like vanilla REINFORCE while V catches up. */
 typedef struct {
     int nx, nh, ny;
 
-    /* Parameters */
-    float *W1, *b1;  /* W1: [nh * nx] row-major */
-    float *W2, *b2;  /* W2: [ny * nh] row-major */
-
-    /* Accumulated gradients */
+    /* Trunk */
+    float *W1, *b1;
     float *dW1, *db1;
+
+    /* Policy head */
+    float *W2, *b2;
     float *dW2, *db2;
 
+    /* Value head */
+    float *Wv, *bv;
+    float *dWv, *dbv;
+
     /* Forward activation cache */
-    float *h;        /* [nh] post-ReLU hidden */
-    float *logits;   /* [ny] */
-    float *probs;    /* [ny] */
+    float *h;
+    float *logits;
+    float *probs;
+    float  value;
 
     /* Backward scratch */
     float *dh;
@@ -40,12 +54,8 @@ int   mlp_sample_action(const MLP *m, Rng *rng);
 
 void  mlp_zero_grad(MLP *m);
 
-/* REINFORCE + entropy regularizer gradient accumulation. Caller passes
- * the h and probs cached from the forward that produced `action` (so
- * the same masked distribution is used for sampling and backward).
- *   d/dz_j [-adv * log pi(a|x)] = adv * (probs_j - 1[j==a])
- *   d/dz_j [-beta * H(pi)]      = beta * probs_j * (log probs_j + H)
- * Pass entropy_beta = 0 to disable the regularizer. */
+/* Pure REINFORCE + entropy. Used by train_viz (visualization) and any
+ * caller that doesn't want to train a value head. */
 void  mlp_accum_policy_grad(MLP *m,
                              const float *x,
                              const float *h,
@@ -53,6 +63,24 @@ void  mlp_accum_policy_grad(MLP *m,
                              int action,
                              float advantage,
                              float entropy_beta);
+
+/* Actor-critic gradient: policy uses advantage = G - value_cached, value
+ * head trained with MSE(V, G), entropy regularizer on the policy.
+ *   policy:  d/dz_j = (G - V) * (probs_j - 1[j==a]) + beta * p_j (log p_j + H)
+ *   value:   d/dV   = 2 * value_coef * (V - G)
+ * Both heads' gradients flow into the shared trunk. The advantage is
+ * detached: we use V as a numerical baseline only, not as a target the
+ * policy loss differentiates through. */
+void  mlp_accum_ac_grad(MLP *m,
+                         const float *x,
+                         const float *h,
+                         const float *probs,
+                         float value_cached,
+                         int action,
+                         float G,
+                         float entropy_beta,
+                         float value_coef);
+
 void  mlp_apply_sgd(MLP *m, float lr);
 
 #endif

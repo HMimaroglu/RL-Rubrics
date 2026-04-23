@@ -13,8 +13,10 @@ MLP *mlp_new(int nx, int nh, int ny, Rng *rng) {
 
     m->W1 = zeros(nh * nx); m->b1 = zeros(nh);
     m->W2 = zeros(ny * nh); m->b2 = zeros(ny);
+    m->Wv = zeros(nh);      m->bv = zeros(1);
     m->dW1 = zeros(nh * nx); m->db1 = zeros(nh);
     m->dW2 = zeros(ny * nh); m->db2 = zeros(ny);
+    m->dWv = zeros(nh);      m->dbv = zeros(1);
     m->h = zeros(nh);
     m->logits = zeros(ny);
     m->probs  = zeros(ny);
@@ -27,6 +29,10 @@ MLP *mlp_new(int nx, int nh, int ny, Rng *rng) {
     /* Smaller init for policy head so initial policy is near-uniform */
     float s2 = sqrtf(1.0f / (float)nh) * 0.1f;
     for (int i = 0; i < ny * nh; i++) m->W2[i] = rng_normal(rng) * s2;
+    /* Value head: zero-init both Wv and bv. V(s) = 0 at start, so initial
+     * advantage = G - 0 = G and the early policy update matches vanilla
+     * REINFORCE. V then learns through the value-MSE gradient. */
+    /* (Wv and bv are already zero from calloc / zeros() above.) */
 
     return m;
 }
@@ -34,7 +40,9 @@ MLP *mlp_new(int nx, int nh, int ny, Rng *rng) {
 void mlp_free(MLP *m) {
     if (!m) return;
     free(m->W1); free(m->b1); free(m->W2); free(m->b2);
+    free(m->Wv); free(m->bv);
     free(m->dW1); free(m->db1); free(m->dW2); free(m->db2);
+    free(m->dWv); free(m->dbv);
     free(m->h); free(m->logits); free(m->probs);
     free(m->dh); free(m->dlogits);
     free(m);
@@ -73,6 +81,11 @@ void mlp_forward(MLP *m, const float *x, int forbidden_face) {
     }
     float inv = 1.0f / sum;
     for (int j = 0; j < m->ny; j++) m->probs[j] *= inv;
+
+    /* Value head: V(s) = Wv . h + bv */
+    float v = m->bv[0];
+    for (int i = 0; i < m->nh; i++) v += m->Wv[i] * m->h[i];
+    m->value = v;
 }
 
 int mlp_sample_action(const MLP *m, Rng *rng) {
@@ -90,6 +103,8 @@ void mlp_zero_grad(MLP *m) {
     memset(m->db1, 0, sizeof(float) * (size_t)m->nh);
     memset(m->dW2, 0, sizeof(float) * (size_t)m->ny * m->nh);
     memset(m->db2, 0, sizeof(float) * (size_t)m->ny);
+    memset(m->dWv, 0, sizeof(float) * (size_t)m->nh);
+    m->dbv[0] = 0.0f;
 }
 
 /* Gradient for one step, combining REINFORCE and an optional entropy
@@ -150,10 +165,79 @@ void mlp_accum_policy_grad(MLP *m,
     }
 }
 
+/* Actor-critic gradient: combines policy + entropy + value MSE.
+ * The advantage scalar (G - value_cached) is detached: we treat V as a
+ * numerical baseline only when computing the policy gradient. The value
+ * head's MSE gradient still trains V through Wv/bv and the trunk. */
+void mlp_accum_ac_grad(MLP *m,
+                        const float *x,
+                        const float *h,
+                        const float *probs,
+                        float value_cached,
+                        int action,
+                        float G,
+                        float entropy_beta,
+                        float value_coef) {
+    float advantage = G - value_cached;
+
+    /* Policy gradient into dlogits */
+    for (int j = 0; j < m->ny; j++) {
+        m->dlogits[j] = advantage * (probs[j] - (j == action ? 1.0f : 0.0f));
+    }
+    if (entropy_beta > 0.0f) {
+        float H = 0.0f;
+        for (int j = 0; j < m->ny; j++) {
+            float p = probs[j];
+            if (p > 1e-12f) H -= p * logf(p);
+        }
+        for (int j = 0; j < m->ny; j++) {
+            float p = probs[j];
+            if (p > 1e-12f) {
+                m->dlogits[j] += entropy_beta * p * (logf(p) + H);
+            }
+        }
+    }
+
+    /* Policy head param grads */
+    for (int j = 0; j < m->ny; j++) m->db2[j] += m->dlogits[j];
+    for (int j = 0; j < m->ny; j++) {
+        float dz = m->dlogits[j];
+        if (dz == 0.0f) continue;
+        float *w = m->dW2 + (size_t)j * m->nh;
+        for (int i = 0; i < m->nh; i++) w[i] += dz * h[i];
+    }
+
+    /* Value head MSE grad: d/dV [c (V - G)^2] = 2 c (V - G) */
+    float dvalue = 2.0f * value_coef * (value_cached - G);
+    m->dbv[0] += dvalue;
+    for (int i = 0; i < m->nh; i++) m->dWv[i] += dvalue * h[i];
+
+    /* Backprop into hidden from BOTH heads, then ReLU mask */
+    for (int i = 0; i < m->nh; i++) {
+        float s = 0.0f;
+        for (int j = 0; j < m->ny; j++) {
+            s += m->W2[(size_t)j * m->nh + i] * m->dlogits[j];
+        }
+        s += m->Wv[i] * dvalue;
+        m->dh[i] = (h[i] > 0.0f) ? s : 0.0f;
+    }
+
+    /* Trunk param grads */
+    for (int i = 0; i < m->nh; i++) m->db1[i] += m->dh[i];
+    for (int i = 0; i < m->nh; i++) {
+        float d = m->dh[i];
+        if (d == 0.0f) continue;
+        float *w = m->dW1 + (size_t)i * m->nx;
+        for (int k = 0; k < m->nx; k++) w[k] += d * x[k];
+    }
+}
+
 void mlp_apply_sgd(MLP *m, float lr) {
     int n;
     n = m->nh * m->nx; for (int i = 0; i < n; i++) m->W1[i] -= lr * m->dW1[i];
     n = m->nh;         for (int i = 0; i < n; i++) m->b1[i] -= lr * m->db1[i];
     n = m->ny * m->nh; for (int i = 0; i < n; i++) m->W2[i] -= lr * m->dW2[i];
     n = m->ny;         for (int i = 0; i < n; i++) m->b2[i] -= lr * m->db2[i];
+    n = m->nh;         for (int i = 0; i < n; i++) m->Wv[i] -= lr * m->dWv[i];
+                                                   m->bv[0] -= lr * m->dbv[0];
 }
