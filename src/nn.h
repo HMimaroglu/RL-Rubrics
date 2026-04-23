@@ -81,6 +81,37 @@ void  mlp_accum_ac_grad(MLP *m,
                          float entropy_beta,
                          float value_coef);
 
+/* PPO clipped surrogate gradient. Caller passes:
+ *   probs_new, value_new, h_new : results of a forward pass on x with the
+ *                                 CURRENT (epoch-K) weights (not the cached
+ *                                 sampling-time values).
+ *   action, advantage, G        : from the original rollout.
+ *   old_log_pi                  : log pi_old(action | x), captured at the
+ *                                 time of action sampling.
+ *   clip_eps                    : PPO clip range, typically 0.2.
+ *
+ * The clipped objective is:
+ *   L = -min(ratio * A, clip(ratio, 1-eps, 1+eps) * A)
+ * where ratio = exp(log pi_new - log pi_old).
+ *
+ * For the unclipped branch the gradient w.r.t. logits is
+ *   d/dz_j = ratio * A * (probs_j - 1[j==a]).
+ * In the clipped branch the surrogate is constant in the policy, so the
+ * policy contribution to the gradient is 0. Value MSE and entropy are
+ * applied unconditionally. */
+void  mlp_accum_ppo_grad(MLP *m,
+                          const float *x,
+                          const float *h_new,
+                          const float *probs_new,
+                          float value_new,
+                          int action,
+                          float advantage,
+                          float G,
+                          float old_log_pi,
+                          float clip_eps,
+                          float entropy_beta,
+                          float value_coef);
+
 void  mlp_apply_sgd(MLP *m, float lr);
 
 #endif

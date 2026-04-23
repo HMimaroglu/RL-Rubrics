@@ -32,22 +32,27 @@
 #define NX (54 * 6)
 #define NH 128
 #define NY MV_COUNT
-#define LR 0.01f
+#define LR 0.001f             /* PPO is more stable, but multi-epoch needs smaller LR */
 #define GAMMA 0.99f
-#define ENTROPY_BETA 0.05f
-#define VALUE_COEF   0.25f
-#define WIN_WINDOW        200
+#define ENTROPY_BETA 0.01f
+#define VALUE_COEF   0.5f
+#define CLIP_EPS     0.2f     /* PPO clip range */
+#define PPO_EPOCHS   4
+#define WIN_WINDOW        500
 #define ADVANCE_THRESHOLD 0.95f
 #define MAX_SCRAMBLE      30
 #define MAX_EP_STEPS      64
 
-#define BATCH 64
+#define BATCH 1024
+/* Worst-case transitions per training step: BATCH * MAX_EP_STEPS. */
+#define MAX_TRANSITIONS (BATCH * MAX_EP_STEPS)
 
 typedef struct {
     float x[NX];
     float h[NH];
     float probs[NY];
     float value;
+    float old_log_pi;
     int   action;
     int   forbidden_face;
 } Step;
@@ -88,6 +93,19 @@ typedef struct {
 } App;
 
 static App app;
+
+/* Flat per-transition buffers for PPO updates (kept at file scope to
+ * avoid 16+ MB stack allocations). */
+static float flat_x         [MAX_TRANSITIONS * NX];
+static float flat_h_new     [MAX_TRANSITIONS * NH];
+static float flat_probs_new [MAX_TRANSITIONS * NY];
+static float flat_value_new [MAX_TRANSITIONS];
+static int   flat_action    [MAX_TRANSITIONS];
+static int   flat_mask      [MAX_TRANSITIONS];
+static float flat_return    [MAX_TRANSITIONS];
+static float flat_advantage [MAX_TRANSITIONS];
+static float flat_old_logpi [MAX_TRANSITIONS];
+static float flat_value_old [MAX_TRANSITIONS];
 
 static void encode(const Cube *c, float *out) {
     for (int i = 0; i < NX; i++) out[i] = 0.0f;
@@ -165,6 +183,10 @@ static int batch_step(int budget) {
         int a = sample_from_probs(&app.buf_probs[b * NY], NY, &app.rng);
         e->traj[t].action = a;
         e->traj[t].forbidden_face = e->forbidden_face;
+        /* Cache log pi_old(a|s) for PPO. probs are post-mask, post-softmax. */
+        float p_a = app.buf_probs[b * NY + a];
+        if (p_a < 1e-12f) p_a = 1e-12f;
+        e->traj[t].old_log_pi = logf(p_a);
         e->forbidden_face = a / 3;
         e->T++;
         cube_apply_move(&e->cube, (Move)a);
@@ -174,23 +196,97 @@ static int batch_step(int budget) {
     return 1;
 }
 
-/* After all episodes finish: backward + SGD update + window bookkeeping. */
+/* After all episodes finish: PPO update + window bookkeeping.
+ *
+ *   1. Flatten all (s, a, V_old, log pi_old) transitions across the batch.
+ *   2. Compute Monte-Carlo returns G_t and advantages A_t = G_t - V_old(s_t).
+ *   3. Normalize advantages to mean 0 / std 1 across the whole batch.
+ *   4. For PPO_EPOCHS:
+ *        a. Push current weights to GPU.
+ *        b. GPU forward over the flattened transitions in chunks of BATCH
+ *           (re-evaluating probs and V under the *current* policy, with
+ *           the same mask used at sampling time).
+ *        c. Accumulate PPO clipped-surrogate gradients.
+ *        d. Apply one SGD step.
+ */
 static void finish_batch(void) {
-    mlp_zero_grad(app.net);
+    /* Flatten. */
+    int N = 0;
     for (int b = 0; b < BATCH; b++) {
         Episode *e = &app.eps[b];
         int T = e->T;
         int solved = e->solved;
-        for (int t = 0; t < T; t++) {
-            float G = solved ? powf(GAMMA, (float)(T - 1 - t)) : 0.0f;
-            mlp_accum_ac_grad(app.net, e->traj[t].x, e->traj[t].h, e->traj[t].probs,
-                              e->traj[t].value, e->traj[t].action, G,
-                              ENTROPY_BETA, VALUE_COEF);
+        /* Compute returns for this episode (sparse 0/1 reward at terminal). */
+        float G = 0.0f;
+        for (int t = T - 1; t >= 0; t--) {
+            float r = (solved && t == T - 1) ? 1.0f : 0.0f;
+            G = r + GAMMA * G;
+            int idx = N + t;
+            flat_return[idx] = G;
         }
+        for (int t = 0; t < T; t++) {
+            int idx = N + t;
+            memcpy(&flat_x[idx * NX], e->traj[t].x, NX * sizeof(float));
+            flat_action    [idx] = e->traj[t].action;
+            flat_mask      [idx] = e->traj[t].forbidden_face;
+            flat_old_logpi [idx] = e->traj[t].old_log_pi;
+            flat_value_old [idx] = e->traj[t].value;
+            flat_advantage [idx] = flat_return[idx] - e->traj[t].value;
+        }
+        N += T;
     }
-    /* Average across batch (equivalent CPU per-episode update magnitude). */
-    mlp_apply_sgd(app.net, LR / (float)BATCH);
 
+    /* Normalize advantages to mean 0 / std 1. Cuts gradient variance a lot. */
+    if (N > 1) {
+        double sum = 0.0;
+        for (int i = 0; i < N; i++) sum += flat_advantage[i];
+        float mean = (float)(sum / N);
+        double var_sum = 0.0;
+        for (int i = 0; i < N; i++) {
+            float d = flat_advantage[i] - mean;
+            var_sum += (double)d * d;
+        }
+        float std = sqrtf((float)(var_sum / N)) + 1e-8f;
+        for (int i = 0; i < N; i++) flat_advantage[i] = (flat_advantage[i] - mean) / std;
+    }
+
+    /* PPO epochs. */
+    for (int epoch = 0; epoch < PPO_EPOCHS; epoch++) {
+        gpu_mlp_upload_params(app.gpu,
+                               app.net->W1, app.net->b1,
+                               app.net->W2, app.net->b2,
+                               app.net->Wv, app.net->bv);
+
+        /* Re-forward all transitions under current policy, in chunks. */
+        for (int chunk = 0; chunk < N; chunk += BATCH) {
+            int cs = (N - chunk < BATCH) ? (N - chunk) : BATCH;
+            gpu_mlp_forward(app.gpu, cs,
+                             &flat_x[chunk * NX],
+                             &flat_mask[chunk],
+                             &flat_h_new    [chunk * NH],
+                             &flat_probs_new[chunk * NY],
+                             &flat_value_new[chunk]);
+        }
+
+        /* Accumulate gradients across all transitions. */
+        mlp_zero_grad(app.net);
+        for (int i = 0; i < N; i++) {
+            mlp_accum_ppo_grad(app.net,
+                                &flat_x        [i * NX],
+                                &flat_h_new    [i * NH],
+                                &flat_probs_new[i * NY],
+                                flat_value_new [i],
+                                flat_action    [i],
+                                flat_advantage [i],
+                                flat_return    [i],
+                                flat_old_logpi [i],
+                                CLIP_EPS, ENTROPY_BETA, VALUE_COEF);
+        }
+        /* Mean over transitions. */
+        if (N > 0) mlp_apply_sgd(app.net, LR / (float)N);
+    }
+
+    /* Window bookkeeping. */
     for (int b = 0; b < BATCH; b++) {
         int outcome = app.eps[b].solved ? 1 : 0;
         if (app.wcount < WIN_WINDOW) {

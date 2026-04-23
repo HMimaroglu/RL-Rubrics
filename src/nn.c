@@ -232,6 +232,90 @@ void mlp_accum_ac_grad(MLP *m,
     }
 }
 
+/* PPO gradient: clipped surrogate for the policy, MSE for the value head,
+ * entropy regularizer. Callers should re-forward x with current weights
+ * (so probs_new and value_new reflect the up-to-date policy this epoch),
+ * then pass old_log_pi captured at sampling time. */
+void mlp_accum_ppo_grad(MLP *m,
+                         const float *x,
+                         const float *h_new,
+                         const float *probs_new,
+                         float value_new,
+                         int action,
+                         float advantage,
+                         float G,
+                         float old_log_pi,
+                         float clip_eps,
+                         float entropy_beta,
+                         float value_coef) {
+    /* log pi_new(a|x). Probs come from a masked softmax so the chosen
+     * action's prob should be > 0; clamp anyway against log(0). */
+    float p_a = probs_new[action];
+    if (p_a < 1e-12f) p_a = 1e-12f;
+    float log_pi_new = logf(p_a);
+    float ratio = expf(log_pi_new - old_log_pi);
+
+    /* Clipped surrogate: when the unclipped term is the active one in min(),
+     * the policy gradient flows; otherwise the surrogate is constant in pi
+     * and the policy contribution is zero. */
+    float coef = 0.0f;
+    if (advantage >= 0.0f) {
+        if (ratio <= 1.0f + clip_eps) coef = ratio * advantage;
+    } else {
+        if (ratio >= 1.0f - clip_eps) coef = ratio * advantage;
+    }
+
+    for (int j = 0; j < m->ny; j++) {
+        m->dlogits[j] = coef * (probs_new[j] - (j == action ? 1.0f : 0.0f));
+    }
+    if (entropy_beta > 0.0f) {
+        float H = 0.0f;
+        for (int j = 0; j < m->ny; j++) {
+            float p = probs_new[j];
+            if (p > 1e-12f) H -= p * logf(p);
+        }
+        for (int j = 0; j < m->ny; j++) {
+            float p = probs_new[j];
+            if (p > 1e-12f) {
+                m->dlogits[j] += entropy_beta * p * (logf(p) + H);
+            }
+        }
+    }
+
+    /* Policy head param grads */
+    for (int j = 0; j < m->ny; j++) m->db2[j] += m->dlogits[j];
+    for (int j = 0; j < m->ny; j++) {
+        float dz = m->dlogits[j];
+        if (dz == 0.0f) continue;
+        float *w = m->dW2 + (size_t)j * m->nh;
+        for (int i = 0; i < m->nh; i++) w[i] += dz * h_new[i];
+    }
+
+    /* Value head MSE grad */
+    float dvalue = 2.0f * value_coef * (value_new - G);
+    m->dbv[0] += dvalue;
+    for (int i = 0; i < m->nh; i++) m->dWv[i] += dvalue * h_new[i];
+
+    /* Backprop into hidden from BOTH heads, then ReLU mask */
+    for (int i = 0; i < m->nh; i++) {
+        float s = 0.0f;
+        for (int j = 0; j < m->ny; j++) {
+            s += m->W2[(size_t)j * m->nh + i] * m->dlogits[j];
+        }
+        s += m->Wv[i] * dvalue;
+        m->dh[i] = (h_new[i] > 0.0f) ? s : 0.0f;
+    }
+
+    /* Trunk param grads */
+    for (int i = 0; i < m->nh; i++) m->db1[i] += m->dh[i];
+    for (int i = 0; i < m->nh; i++) {
+        float d = m->dh[i];
+        if (d == 0.0f) continue;
+        float *w = m->dW1 + (size_t)i * m->nx;
+        for (int k = 0; k < m->nx; k++) w[k] += d * x[k];
+    }
+}
+
 void mlp_apply_sgd(MLP *m, float lr) {
     int n;
     n = m->nh * m->nx; for (int i = 0; i < n; i++) m->W1[i] -= lr * m->dW1[i];
