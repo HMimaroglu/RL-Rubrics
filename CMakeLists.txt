@@ -55,7 +55,7 @@ if(WIN32)
     target_link_libraries(gpu_nn_test PRIVATE gdi32)
 endif()
 
-# Batched GPU trainer: B=256 parallel episodes, GPU forward, CPU backward.
+# Batched GPU trainer: B parallel episodes, GPU forward, CPU backward.
 add_executable(gpu_train
     src/gpu_train.c
     src/gpu_nn.c
@@ -68,6 +68,25 @@ target_include_directories(gpu_train PRIVATE src)
 target_link_libraries(gpu_train PRIVATE glfw OpenGL::GL)
 if(WIN32)
     target_link_libraries(gpu_train PRIVATE gdi32)
+endif()
+
+# GPU-backed visualizer: same batched training as gpu_train, with the
+# 3D cube renderer + HUD on top. Visualizes episode 0.
+add_executable(gpu_train_viz
+    src/gpu_train_viz.c
+    src/gpu_nn.c
+    src/gl_loader.c
+    src/cube.c
+    src/camera.c
+    src/renderer.c
+    src/hud.c
+    src/nn.c
+    src/rng.c
+)
+target_include_directories(gpu_train_viz PRIVATE src)
+target_link_libraries(gpu_train_viz PRIVATE glfw OpenGL::GL)
+if(WIN32)
+    target_link_libraries(gpu_train_viz PRIVATE gdi32)
 endif()
 
 # Live visualization of training progress: cube + HUD bars.
