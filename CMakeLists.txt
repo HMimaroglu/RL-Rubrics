@@ -40,6 +40,21 @@ if(WIN32)
     target_link_libraries(gpu_check PRIVATE gdi32)
 endif()
 
+# GPU MLP correctness + throughput test: same weights through CPU MLP
+# and GpuMlp, verifies outputs match within float precision.
+add_executable(gpu_nn_test
+    src/gpu_nn_test.c
+    src/gpu_nn.c
+    src/gl_loader.c
+    src/nn.c
+    src/rng.c
+)
+target_include_directories(gpu_nn_test PRIVATE src)
+target_link_libraries(gpu_nn_test PRIVATE glfw OpenGL::GL)
+if(WIN32)
+    target_link_libraries(gpu_nn_test PRIVATE gdi32)
+endif()
+
 # Live visualization of training progress: cube + HUD bars.
 add_executable(train_viz
     src/train_viz.c
