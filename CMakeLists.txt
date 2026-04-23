@@ -28,6 +28,18 @@ add_executable(train
 )
 target_include_directories(train PRIVATE src)
 
+# GPU compute-shader sanity check: confirms the system supports
+# OpenGL 4.3 compute and the SSBO/dispatch pipeline works end-to-end.
+add_executable(gpu_check
+    src/gpu_check.c
+    src/gl_loader.c
+)
+target_include_directories(gpu_check PRIVATE src)
+target_link_libraries(gpu_check PRIVATE glfw OpenGL::GL)
+if(WIN32)
+    target_link_libraries(gpu_check PRIVATE gdi32)
+endif()
+
 # Live visualization of training progress: cube + HUD bars.
 add_executable(train_viz
     src/train_viz.c

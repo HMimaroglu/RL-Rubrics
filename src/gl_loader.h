@@ -33,10 +33,19 @@ extern PFNGLUSEPROGRAMPROC              glUseProgram;
 extern PFNGLDELETEPROGRAMPROC           glDeleteProgram;
 extern PFNGLGETUNIFORMLOCATIONPROC      glGetUniformLocation;
 extern PFNGLUNIFORMMATRIX4FVPROC        glUniformMatrix4fv;
+extern PFNGLUNIFORM1FPROC               glUniform1f;
 extern PFNGLUNIFORM3FPROC               glUniform3f;
 extern PFNGLUNIFORM3FVPROC              glUniform3fv;
 extern PFNGLUNIFORM1IPROC               glUniform1i;
 extern PFNGLUNIFORM1IVPROC              glUniform1iv;
+
+/* Compute shader / SSBO functions (require GL 4.3+). */
+extern PFNGLDISPATCHCOMPUTEPROC         glDispatchCompute;
+extern PFNGLMEMORYBARRIERPROC           glMemoryBarrier;
+extern PFNGLBINDBUFFERBASEPROC          glBindBufferBase;
+extern PFNGLGETBUFFERSUBDATAPROC        glGetBufferSubData;
+extern PFNGLMAPBUFFERRANGEPROC          glMapBufferRange;
+extern PFNGLUNMAPBUFFERPROC             glUnmapBuffer;
 
 /* Returns 1 on success, 0 if any function failed to resolve.
  * Must be called after a GL context is current. */
